@@ -18,8 +18,9 @@
 ;; data from a rics server and to control the server.
 ;;
 ;;; Code:
-(require 'cl)
+(require 'cl-lib)
 (require 'transient)
+(require 'calc)
 
 
 (defvar rics-ricsctl-cmd "ricsctl"
@@ -33,6 +34,9 @@
 
 (defvar rics-data-format-hex t
   "Format the data in the csv as hex instead of as decimal.")
+
+(defvar *rics-state* nil
+  "Used internally by the predicates as state")
 
 (defun rics-add-svr-args (args)
   "Prepend the list of arguments given ARGS with the required serve options."
@@ -67,7 +71,7 @@
 
 (defun rics-get-option-value (name)
   "Get the option NAME for options in the format name=value."
-  (let ((op (find-if #'(lambda (v) (s-prefix-p name v)) (transient-args transient-current-command))))
+  (let ((op (cl-find-if #'(lambda (v) (s-prefix-p name v)) (transient-args transient-current-command))))
     (if op
         (let ((val-pos (string-match "=" op)))
           (if val-pos
@@ -221,7 +225,7 @@
   "Convert the string STR in format date.ms to a float. The OFFSET parameter specifies the origin."
   (- (let* ((dt (s-split "\\." str))
             (ms (+ (* 1000 (time-convert (date-to-time (car dt)) 'integer))
-                   (floor (* 1000 (string-to-number (concat "0." (second dt))))))))
+                   (floor (* 1000 (string-to-number (concat "0." (cl-second dt))))))))
        ms)
      (if (rics-get-option-value "--timestamp-normalise") (or offset 0) 0)))
 
@@ -257,8 +261,8 @@
 
 (defun rics-print-csv (mess)
   "Formats a message into a string"
-  (format (concat "%s," (if rics-id-format-hex "%x" "%d") ",%s,%s\n") (getf mess :time) (getf mess :id) (getf mess :len)
-          (mapconcat #'(lambda (x) (format (if rics-data-format-hex "%x" "%d") x)) (seq-take (getf mess :data) (getf mess :len)) ",")))
+  (format (concat "%s," (if rics-id-format-hex "%x" "%d") ",%s,%s\n") (cl-getf mess :time) (cl-getf mess :id) (cl-getf mess :len)
+          (mapconcat #'(lambda (x) (format (if rics-data-format-hex "%x" "%d") x)) (cl-getf mess :data) ",")))
 
 (defun rics-parse-region (ptmin ptmax)
   "Parse the region as a list of can message structure. Skips malformed items."
@@ -286,6 +290,7 @@
     (let ((reg (rics-parse-region ptmin ptmax)))
       (unless dest (kill-region ptmin ptmax))
       (goto-char ptmin)
+      (setq *rics-state* nil)
       (dolist (v reg)
         (with-current-buffer (get-buffer-create (or dest (current-buffer)))
           (when (funcall pred v) (insert (rics-print-csv v))))))))
@@ -304,19 +309,26 @@
   "Extract the data from the predicate PRED to the buffer BUF."
   (interactive "r\naPredicate:\ni")
   (save-excursion
-    (let ((reg (rics-parse-region ptmin ptmax)))
+    (let ((reg (rics-parse-region ptmin ptmax))
+          (timestampp (rics-get-option-value "--timestamp-format")))
       (unless buf (kill-region ptmin ptmax))
       (goto-char ptmin)
       (if (equal buf 'calc)
-          (let* ((offset (rics-date-to-ms (getf (first reg) :time)))
-                 (ts (remove nil (mapcar (lambda (x) (if (funcall pred x) (calc-eval (rics-date-to-ms (getf x :time) offset) 'raw))) reg)))
-                (dat (remove nil (mapcar pred reg))))
-            (rics-push-ms-formatted (cons 'vec ts))
-            (calc-push (cons 'vec dat)))
+          (progn
+            (setq *rics-state* nil)
+            (let ((dat (remove nil (mapcar pred reg))))
+              (when timestampp
+                (setq *rics-state* nil)
+                (let* ((offset (rics-date-to-ms (cl-getf (cl-first reg) :time)))
+                       (ts (remove nil (mapcar (lambda (x) (if (funcall pred x) (rics-date-to-ms (cl-getf x :time) offset))) reg))))
+                  (rics-push-ms-formatted (cons 'vec ts))))
+              (calc-push (cons 'vec dat))))
+        (progn
+          (setq *rics-state* nil)
           (dolist (v reg)
             (let ((res (funcall pred v)))
               (with-current-buffer (get-buffer-create (or buf (current-buffer)))
-                (when res (insert (format "%s,%s\n" (getf v :time) res))))))))))
+                (when res (insert (format "%s,%s\n" (cl-getf v :time) res)))))))))))
 (defun rics-extract-buffer (pred &optional buf dest)
   "Extract the data from the predicate PRED."
   (interactive "aPredicate:\nbSource:\nBDest:")
@@ -333,17 +345,15 @@
     (rics-extract-region (point-min) (point-max) pred 'calc)))
 
 
-;; Plot (wrap gnuplot), Fold
-
 
 (defmacro rics-register-predicate (name &rest body)
   "Register the predicate F with name NAME so it can be used as an input for the filter/extract/plot functions."
-  (push name rics-predicates)
-  `(defun ,(intern (concat "rics-predicate-" name)) (item) (let ((id (getf item :id))
-                                                                 (len (getf item :len))
-                                                                 (data (getf item :data))
-                                                                 (time (getf item :time)))
-                                                             ,@body)))
+  `(progn (push ,name rics-predicates)
+          (defalias (intern (concat "rics-predicate-" ,name)) (lambda (item) (let ((id (cl-getf item :id))
+                                                                                    (len (cl-getf item :len))
+                                                                                    (data (cl-getf item :data))
+                                                                                    (time (cl-getf item :time)))
+                                                                                ,@body)))))
 (defmacro rics-register-uint8 (name id mask offset)
   "Register a predicate named NAME with a uint8_t in message ID with offset OFFSET."
   `(rics-register-predicate ,name
@@ -366,8 +376,6 @@
                                              (if (> d 32767) (- 65536 d) d)))))
 
 
-
-
 ;; TODO Live functions (live plot, live show data, etc)
 
 ;(transient-define-argument rics-arg-filter-id ()
@@ -377,7 +385,7 @@
 ;  :shortarg "-i"
 ;  :argument "--id=")
 
-;; TODO Transient data iface
+;; Transient data iface
 
 (defun rics-gen-predicate-str (str)
   "Generate a predicate from the string STR. Prefer a predicate defined in rics-predicates."
@@ -389,14 +397,14 @@
   :class 'transient-option
   :shortarg "-p"
   :argument "--predicate="
-  :choices #'(lambda (a b c) rics-predicates))
+  :choices #'(lambda (_a _b _c) rics-predicates))
 (transient-define-argument rics-arg-sourcebuffer ()
   "Select the source buffer for the action"
   :description "Source buffer"
   :class 'transient-option
   :shortarg "-b"
   :argument "--buffer="
-  :choices #'(lambda (a b c) (mapcar #'buffer-name (buffer-list))))
+  :choices #'(lambda (_a _b _c) (mapcar #'buffer-name (buffer-list))))
 (transient-define-argument rics-arg-targetbuffer ()
   "Select the target buffer for the action"
   :description "Target buffer"
@@ -457,20 +465,26 @@
              (if (and (use-region-p) (not source))
                  (rics-parse-region (region-beginning) (region-end))
                (rics-parse-buffer source)))))
-
-
+(transient-define-suffix rics-plot-this-function ()
+  "Plot the given predicate"
+  :description "Plot this function with calc"
+  (interactive)
+  (rics-add-plot-function)
+  (calc-graph-plot 0))
 
 (transient-define-prefix rics-data ()
   "Process rics data"
-  ["Parameters"
+  ["Timestamp"
    ("=" rics-arg-timestamp-format)
-   ("N" "Normalise timestamp to first input" "--timestamp-normalise")
+   ("N" "Normalise timestamp to first input" "--timestamp-normalise")]
+  ["Parameters"
    ("p" rics-arg-predicate)
    ("b" rics-arg-sourcebuffer)
    ("t" rics-arg-targetbuffer)]
   ["Actions"
    ("P" rics-parse-function)
    ("a" rics-add-plot-function)
+   ("g" rics-plot-this-function)
    ("f" rics-filter-function)
    ("d" rics-extract-function)
    ("c" rics-calc-function)])
@@ -482,7 +496,3 @@
 
 (provide 'ricsctl)
 ;;; ricsctl.el ends here
-
-(print steeve)
-
-(print (car var))
