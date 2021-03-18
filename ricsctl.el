@@ -21,6 +21,7 @@
 (require 'cl)
 (require 'transient)
 
+
 (defvar rics-ricsctl-cmd "ricsctl"
   "The command to call when starting a ricsctl process.")
 
@@ -241,17 +242,18 @@
     (_ nil)))
 
 
-
-;; FIXME subseq here is very slow
 (defun rics-parse (str)
   "Parse a string into a can message structure"
-  (ignore-errors
-      (let* ((m (split-string str ","))
-             (ts (nth 0 m))
-             (id (string-to-number (nth 1 m) (if rics-id-format-hex 16 10)))
-             (l (string-to-number (nth 2 m)))
-             (data (mapcar #'(lambda (x) (string-to-number x (if rics-data-format-hex 16 10))) (seq-subseq m 3 (+ 8 3)))))
-        `(:time ,ts :id ,id :len ,l :data ,data))))
+  (let* ((m (split-string str ","))
+         (ts (nth 0 m))
+         (id (string-to-number (nth 1 m) (if rics-id-format-hex 16 10)))
+         (l (string-to-number (nth 2 m)))
+         (dvec (make-vector l 0))
+         (data (cdddr m)))
+    (dotimes (i l)
+      (setf (aref dvec i) (string-to-number (car data) (if rics-data-format-hex 16 10)))
+      (setq data (cdr data)))
+    `(:time ,ts :id ,id :len ,l :data ,dvec)))
 
 (defun rics-print-csv (mess)
   "Formats a message into a string"
@@ -447,6 +449,15 @@
   (calc-graph-add nil)
   (calc-graph-name (rics-get-option-value "--predicate"))
   (calc-pop 2))
+(transient-define-suffix rics-parse-function (var)
+  "Parse to a variable."
+  :description "Parse to variable"
+  (interactive "STarget:")
+  (set var (let ((source (rics-get-option-value "--buffer")))
+             (if (and (use-region-p) (not source))
+                 (rics-parse-region (region-beginning) (region-end))
+               (rics-parse-buffer source)))))
+
 
 
 (transient-define-prefix rics-data ()
@@ -458,6 +469,7 @@
    ("b" rics-arg-sourcebuffer)
    ("t" rics-arg-targetbuffer)]
   ["Actions"
+   ("P" rics-parse-function)
    ("a" rics-add-plot-function)
    ("f" rics-filter-function)
    ("d" rics-extract-function)
@@ -470,3 +482,7 @@
 
 (provide 'ricsctl)
 ;;; ricsctl.el ends here
+
+(print steeve)
+
+(print (car var))
