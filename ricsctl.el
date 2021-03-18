@@ -19,6 +19,7 @@
 ;;
 ;;; Code:
 (require 'cl)
+(require 'transient)
 
 (defvar rics-ricsctl-cmd "ricsctl"
   "The command to call when starting a ricsctl process.")
@@ -67,7 +68,10 @@
   "Get the option NAME for options in the format name=value."
   (let ((op (find-if #'(lambda (v) (s-prefix-p name v)) (transient-args transient-current-command))))
     (if op
-        (substring op (+ 1 (string-match "=" op))))))
+        (let ((val-pos (string-match "=" op)))
+          (if val-pos
+              (substring op (+ 1 val-pos))
+            t)))))
 
 (defun rics-command-out (str)
   "Perform output of the command STR depending of the given options."
@@ -214,10 +218,31 @@
 
 (defun rics-date-to-ms (str &optional offset)
   "Convert the string STR in format date.ms to a float. The OFFSET parameter specifies the origin."
-  (let ((dt (s-split "\\." str)))
-    (+ (* 1000 (time-convert (date-to-time (car dt)) 'integer))
-       (floor (* 1000 (string-to-number (concat "0." (second dt))))))))
+  (- (let* ((dt (s-split "\\." str))
+            (ms (+ (* 1000 (time-convert (date-to-time (car dt)) 'integer))
+                   (floor (* 1000 (string-to-number (concat "0." (second dt))))))))
+       ms)
+     (if (rics-get-option-value "--timestamp-normalise") (or offset 0) 0)))
 
+(defun rics-push-ms-formatted(invec)
+  "Convert the ms calc vector INVEC to the correct format, and push it to the stack."
+  (calc-push invec)
+  (pcase (rics-get-option-value "--timestamp-format")
+    ;; ("ms" (calc-push invec))
+    ("s"
+     (calc-push 1000)
+     (calc-map '( 2 calcFunc-div "/")))
+    ("min"
+     (calc-push 60000)
+     (calc-map '(2 calcFunc-div "/")))
+    ("hr"
+     (calc-push 3600000)
+     (calc-map '(2 calcFunc-div "/")))
+    (_ nil)))
+
+
+
+;; FIXME subseq here is very slow
 (defun rics-parse (str)
   "Parse a string into a can message structure"
   (ignore-errors
@@ -272,6 +297,7 @@
   (interactive "aPredicate:")
   (rics-filter-region (line-beginning-position) (line-end-position) pred))
 
+
 (defun rics-extract-region (ptmin ptmax pred &optional buf )
   "Extract the data from the predicate PRED to the buffer BUF."
   (interactive "r\naPredicate:\ni")
@@ -280,9 +306,10 @@
       (unless buf (kill-region ptmin ptmax))
       (goto-char ptmin)
       (if (equal buf 'calc)
-          (let ((ts (remove nil (mapcar (lambda (x) (if (funcall pred x) (rics-date-to-ms (getf x :time)))) reg)))
+          (let* ((offset (rics-date-to-ms (getf (first reg) :time)))
+                 (ts (remove nil (mapcar (lambda (x) (if (funcall pred x) (calc-eval (rics-date-to-ms (getf x :time) offset) 'raw))) reg)))
                 (dat (remove nil (mapcar pred reg))))
-            (calc-push (cons 'vec ts))
+            (rics-push-ms-formatted (cons 'vec ts))
             (calc-push (cons 'vec dat)))
           (dolist (v reg)
             (let ((res (funcall pred v)))
@@ -315,24 +342,24 @@
                                                                  (data (getf item :data))
                                                                  (time (getf item :time)))
                                                              ,@body)))
-(defmacro rics-register-uint8 (name id offset)
+(defmacro rics-register-uint8 (name id mask offset)
   "Register a predicate named NAME with a uint8_t in message ID with offset OFFSET."
   `(rics-register-predicate ,name
-    (if (= id ,id) (elt data ,offset))))
-(defmacro rics-register-int8 (name id offset)
+    (if (= (logand ,mask id) ,id) (elt data ,offset))))
+(defmacro rics-register-int8 (name id mask offset)
   "Register a predicate named NAME with a int8_t in message ID with offset OFFSET."
   `(rics-register-predicate ,name
-                            (if (= id ,id) (let ((d (elt data ,offset)))
+                            (if (= (logand ,mask id) ,id) (let ((d (elt data ,offset)))
                                              (if (> d 128) (- 256 d) d)))))
-(defmacro rics-register-uint16 (name id offset &optional be)
+(defmacro rics-register-uint16 (name id mask offset &optional be)
   "Register a predicate named NAME with a uint16_t in message ID with offset OFFSET."
   `(rics-register-predicate ,name
-                            (if (= id ,id) (+ (* (if ,be 256 1) (elt data ,offset))
+                            (if (= (logand ,mask id) ,id) (+ (* (if ,be 256 1) (elt data ,offset))
                                               (* (if ,be 1 256) (elt data ,(+ 1 offset)))))))
-(defmacro rics-register-int16 (name id offset &optional be)
+(defmacro rics-register-int16 (name id mask offset &optional be)
   "Register a predicate named NAME with a int16_t in message ID with offset OFFSET."
   `(rics-register-predicate ,name
-                            (if (= id ,id) (let ((d (+ (* (if ,be 256 1) (elt data ,offset))
+                            (if (= (logand ,mask id) ,id) (let ((d (+ (* (if ,be 256 1) (elt data ,offset))
                                                        (* (if ,be 1 256) (elt data ,(+ 1 offset))))))
                                              (if (> d 32767) (- 65536 d) d)))))
 
@@ -376,6 +403,12 @@
   :argument "--target="
   ;; :choices #'(lambda () (mapcar #'buffer-name (buffer-list)))
   )
+(transient-define-argument rics-arg-timestamp-format ()
+  :description "Format timestamp as"
+  :class 'transient-switches
+  :argument-format "--timestamp-format=%s"
+  :argument-regexp "--timestamp-format"
+  :choices '("ms" "s" "min" "hr"))
 
 (transient-define-suffix rics-filter-function ()
   "Apply the filter"
@@ -406,22 +439,29 @@
     (if (and (use-region-p) (not source))
         (rics-extract-region-calc (region-beginning) (region-end) pred)
       (rics-extract-buffer-calc pred source))))
-
+(transient-define-suffix rics-add-plot-function ()
+  "Add a plot of the data"
+  :description "Add data to plot"
+  (interactive)
+  (rics-calc-function)
+  (calc-graph-add nil)
+  (calc-graph-name (rics-get-option-value "--predicate"))
+  (calc-pop 2))
 
 
 (transient-define-prefix rics-data ()
   "Process rics data"
   ["Parameters"
+   ("=" rics-arg-timestamp-format)
+   ("N" "Normalise timestamp to first input" "--timestamp-normalise")
    ("p" rics-arg-predicate)
    ("b" rics-arg-sourcebuffer)
-   ("t" rics-arg-targetbuffer)
-   ]
-
+   ("t" rics-arg-targetbuffer)]
   ["Actions"
+   ("a" rics-add-plot-function)
    ("f" rics-filter-function)
    ("d" rics-extract-function)
-   ("c" rics-calc-function)
-   ])
+   ("c" rics-calc-function)])
 
 
 (global-set-key (kbd "C-c R") 'rics-control)
