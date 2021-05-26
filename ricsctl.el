@@ -29,6 +29,9 @@
 (defvar rics-predicates nil
   "A list of the registered predicates.")
 
+(defvar rics-adv-predicates nil
+  "A list of the advanced predicates")
+
 (defvar rics-id-format-hex t
   "Format the id in the csv as hex instead of as decimal.")
 
